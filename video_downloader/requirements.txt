@@ -1,0 +1,25 @@
+# 视频下载工具依赖清单
+# 安装：pip install -r requirements.txt
+
+# HTTP 请求库（下载核心，页面抓取）
+requests>=2.31.0
+
+# 异步 HTTP（m3u8 分片并发下载）
+aiohttp>=3.9.0
+
+# HTML 解析（提取 video / source / iframe 标签）
+beautifulsoup4>=4.12.0
+
+# ffmpeg 的 Python 封装（m3u8 分片合并为 MP4）
+# 注意：还需在系统中单独安装 ffmpeg 可执行文件
+ffmpeg-python>=0.2.0
+
+# 浏览器自动化（渲染 JS 动态页面、拦截媒体请求）
+# 注意：安装后还需执行 playwright install chromium
+playwright>=1.40.0
+
+# AES-128 解密（部分 m3u8 分片加密时使用）
+pycryptodome>=3.19.0
+
+# 下载进度条
+tqdm>=4.66.0
