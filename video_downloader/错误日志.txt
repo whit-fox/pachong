@@ -1,0 +1,23 @@
+[2026-08-02 15:56:29.660867] 程序启动
+[2026-08-02 15:56:46.513127] 程序启动
+[2026-08-02 16:12:27.859692] 程序启动
+[2026-08-02 16:16:07.200835] 程序启动
+[2026-08-02 16:16:24.934324] 程序启动
+[2026-08-02 16:17:22.599965] 程序启动
+[2026-08-02 16:17:49.875799] 程序启动
+[2026-08-02 16:27:47.385096] 程序启动
+[2026-08-02 16:28:05.535797] 程序启动
+[2026-08-02 16:29:17.864923] 未捕获异常:
+Traceback (most recent call last):
+  File "C:\Users\Zhang\pycharmProjects\pachong\video_downloader\main.py", line 391, in <module>
+    main()
+  File "C:\Users\Zhang\pycharmProjects\pachong\video_downloader\main.py", line 366, in main
+    run_gui(args, initial_urls=args.urls)
+  File "C:\Users\Zhang\pycharmProjects\pachong\video_downloader\gui.py", line 272, in run_gui
+    app.mainloop()
+  File "D:\STUDY\ANACONDA3\Lib\tkinter\__init__.py", line 1485, in mainloop
+    self.tk.mainloop(n)
+KeyboardInterrupt
+
+[2026-08-02 16:29:20.188401] 程序启动
+[2026-08-02 16:29:29.552543] 程序启动

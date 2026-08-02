@@ -9,13 +9,19 @@ config.py —— 全局配置文件
 - 解析参数（iframe 深度、Playwright 等待时间）
 """
 
+import sys
 from pathlib import Path
 
 # ============================================================
 # 基础路径
 # ============================================================
-# 项目根目录（config.py 所在目录）
-BASE_DIR = Path(__file__).resolve().parent
+# 项目根目录：源码运行时是 config.py 所在目录；
+# 打包成 exe 后，__file__ 指向临时解压目录，改用 exe 所在目录，
+# 这样下载文件、urls.txt 都会保存到 exe 旁边。
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 # 默认下载目录（可通过命令行 -o 覆盖）
 DEFAULT_DOWNLOAD_DIR = BASE_DIR / "downloads"

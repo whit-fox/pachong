@@ -20,6 +20,8 @@ import asyncio
 import os
 import re
 import shutil
+import threading
+import time
 
 import aiohttp
 from tqdm import tqdm
@@ -27,7 +29,7 @@ from tqdm import tqdm
 from config import (M3U8_SEGMENT_DIR, MERGE_CLEANUP, SEGMENT_CONCURRENCY,
                     TIMEOUT)
 from utils import (build_session, decode_data_uri, ensure_dir, get_logger,
-                   request_with_retry, resolve_proxy, resolve_url)
+                   human_size, request_with_retry, resolve_proxy, resolve_url)
 
 logger = get_logger("m3u8")
 
@@ -38,7 +40,8 @@ class M3U8Downloader:
     def __init__(self, url: str, output_dir: str = "downloads",
                  filename: str = None, referer: str = None,
                  cookies=None, concurrency: int = SEGMENT_CONCURRENCY,
-                 quality: str = "best", keep_ts: bool = False):
+                 quality: str = "best", keep_ts: bool = False,
+                 extra_headers: dict = None, progress_callback=None):
         self.url = url                # m3u8 地址
         self.output_dir = output_dir  # 输出目录
         self.filename = filename or "video.mp4"
@@ -47,6 +50,24 @@ class M3U8Downloader:
         self.concurrency = concurrency
         self.quality = quality        # best / lowest / "1080" 等
         self.keep_ts = keep_ts        # 合并后是否保留 ts 分片
+        self.extra_headers = extra_headers or {}  # 浏览器抓取的真实防盗链头
+        self._progress_cb = progress_callback     # GUI 进度回调 (downloaded, total, speed)
+        self._pause_event = threading.Event()     # 暂停/继续（分片之间生效）
+        self._pause_event.set()
+
+    # ------------------------------------------------------------
+    # 暂停 / 继续
+    # ------------------------------------------------------------
+    def pause(self) -> None:
+        """暂停下载：等待当前分片下完，不再启动新分片"""
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        """继续下载"""
+        self._pause_event.set()
+
+    def is_paused(self) -> bool:
+        return not self._pause_event.is_set()
 
         self.segments = []            # 分片列表: [{uri, duration, key}]
         self.media_sequence = 0       # 第一个分片的序号（用于默认 IV）
@@ -186,21 +207,45 @@ class M3U8Downloader:
     async def _download_segments_async(self, segment_dir: str) -> None:
         """异步并发下载所有分片，支持重试与 AES 解密"""
         sem = asyncio.Semaphore(self.concurrency)
-        headers = {"Referer": self.referer} if self.referer else {}
+        headers = dict(self.extra_headers)
+        if self.referer and "referer" not in headers:
+            headers["Referer"] = self.referer
         timeout = aiohttp.ClientTimeout(total=TIMEOUT * 3)
 
         async with aiohttp.ClientSession(timeout=timeout, cookies=self.cookies or {},
                                          trust_env=True, proxy=self.proxy) as session:
             session.headers.update(headers)
-            prog = tqdm(total=len(self.segments), unit="ts",
-                        desc="下载分片", mininterval=0.2, ncols=80)
+            # 按字节计数，实时显示 MB/s 网速（不预先知道总大小，故不设 total）
+            prog = tqdm(unit="B", unit_scale=True, unit_divisor=1024,
+                        desc="下载分片", mininterval=0.2, ncols=90, leave=True)
+            last_cb = [time.time(), 0]   # [上次回调时间, 上次已下载字节]
+            smooth = [None]              # 平滑后的瞬时速度
+
+            def _notify_progress():
+                if self._progress_cb:
+                    now = time.time()
+                    if now - last_cb[0] >= 0.2:
+                        dt = now - last_cb[0]
+                        db = prog.n - last_cb[1]
+                        last_cb[0] = now
+                        last_cb[1] = prog.n
+                        inst = db / max(dt, 0.001)
+                        if smooth[0] is None:
+                            smooth[0] = inst
+                        else:
+                            smooth[0] = smooth[0] * 0.7 + inst * 0.3
+                        self._progress_cb(prog.n, None, smooth[0])
 
             async def download_one(idx: int, seg: dict):
                 async with sem:
+                    # 暂停时等待（异步，不阻塞事件循环）
+                    while not self._pause_event.is_set():
+                        await asyncio.sleep(0.2)
                     path = os.path.join(segment_dir, f"{idx:05d}.ts")
-                    # 已存在的分片直接跳过（断点续传）
+                    # 已存在的分片直接跳过（断点续传），已下载字节计入总量
                     if os.path.exists(path) and os.path.getsize(path) > 0:
-                        prog.update(1)
+                        prog.update(os.path.getsize(path))
+                        _notify_progress()
                         return
                     data = await self._fetch_bytes_retry(seg["uri"], session)
                     # AES-128 解密
@@ -208,13 +253,22 @@ class M3U8Downloader:
                         data = await self._decrypt_segment(data, seg["key"], idx, session)
                     with open(path, "wb") as f:
                         f.write(data)
-                    prog.update(1)
+                    prog.update(len(data))
+                    _notify_progress()
 
             tasks = [asyncio.create_task(download_one(i, seg))
                      for i, seg in enumerate(self.segments)]
             # return_exceptions：单个分片失败不阻塞其它分片，全部跑完再统一报错
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            elapsed = time.time() - start
+            downloaded = prog.n
             prog.close()
+
+            # 汇总平均速度
+            if elapsed > 0.1 and downloaded > 0:
+                logger.info("分片下载完成: 共 %s，平均速度 %s/s (用时 %.1f 秒)",
+                            human_size(downloaded),
+                            human_size(downloaded / elapsed), elapsed)
             failed = [r for r in results if isinstance(r, Exception)]
             if failed:
                 raise RuntimeError(f"有 {len(failed)} 个分片下载失败，可重试续传")
@@ -343,7 +397,9 @@ class M3U8Downloader:
     def _fetch_text(self, url: str):
         """同步获取文本内容（m3u8 / 播放列表），m3u8 文件也在海外 CDN 时走代理"""
         session = build_session(cookies=self.cookies, use_proxy=True)
-        headers = {"Referer": self.referer} if self.referer else {}
+        headers = dict(self.extra_headers)
+        if self.referer and "referer" not in headers:
+            headers["Referer"] = self.referer
         try:
             resp = request_with_retry(session, "GET", url, headers=headers)
             if resp.status_code != 200:

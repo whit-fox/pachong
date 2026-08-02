@@ -15,6 +15,7 @@ parser.py —— 视频地址解析器
 """
 
 import logging
+import os
 import re
 import time
 from urllib.parse import urlparse
@@ -32,11 +33,13 @@ logger = get_logger("parser")
 class VideoInfo:
     """一个候选视频资源"""
 
-    def __init__(self, url: str, kind: str, source: str, title: str = ""):
+    def __init__(self, url: str, kind: str, source: str, title: str = "",
+                 headers: dict = None):
         self.url = url          # 视频绝对地址
         self.kind = kind        # "mp4" 或 "m3u8"
         self.source = source    # 发现途径（便于调试）
         self.title = title      # 页面标题，可用作文件名
+        self.headers = headers or {}  # 浏览器实际请求该视频时用到的防盗链头
 
     def __repr__(self):
         return f"<VideoInfo[{self.kind}] from {self.source}: {self.url}>"
@@ -232,15 +235,27 @@ class Parser:
                            "可执行: pip install playwright && playwright install chromium")
             return results
 
+        # 打包成 exe 后，playwright 会把浏览器路径解析到临时解压目录，
+        # 导致找不到浏览器。这里手动指回系统 ms-playwright 缓存目录。
+        # （用户可用环境变量 PLAYWRIGHT_BROWSERS_PATH 覆盖）
+        if os.environ.get("LOCALAPPDATA"):
+            os.environ.setdefault(
+                "PLAYWRIGHT_BROWSERS_PATH",
+                os.path.join(os.environ["LOCALAPPDATA"], "ms-playwright"),
+            )
+
         # 说明：浏览器保持直连加载页面/播放器（避免海外代理出口被国内站 403）。
         # 视频源地址只要被写进 video.src 就能读出来，实际下载由 requests 走代理完成。
         media_urls: set[str] = set()
+        media_headers: dict[str, dict] = {}
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page(user_agent=self.session.headers.get("User-Agent"))
 
-                # 拦截响应：凡是 m3u8/mp4/webm 类型或媒体后缀结尾的，都记下来
+                # 拦截响应：凡是 m3u8/mp4/webm 类型或媒体后缀结尾的，都记下来，
+                # 并记录该请求的防盗链头（Referer/Origin/UA 等），
+                # 供下载时原样重放，绕过 CDN 的 Referer 校验（403）
                 def on_response(resp):
                     ctype = resp.headers.get("content-type", "").lower()
                     url = resp.url
@@ -248,6 +263,12 @@ class Parser:
                             or urlparse(url).path.lower().endswith(
                                 (".m3u8", ".mp4", ".webm", ".ts"))):
                         media_urls.add(url)
+                        hdrs = {}
+                        for k, v in resp.request.headers.items():
+                            if k.lower() in ("referer", "origin", "user-agent",
+                                             "accept", "accept-language"):
+                                hdrs[k.lower()] = v
+                        media_headers[url] = hdrs
 
                 page.on("response", on_response)
 
@@ -264,8 +285,14 @@ class Parser:
                                     "els => els.map(e => e.src || e.currentSrc)"
                                     ".filter(Boolean)",
                                 )
-                                media_urls.update(s for s in srcs
-                                                  if s.startswith("http"))
+                                for s in srcs:
+                                    if not s.startswith("http"):
+                                        continue
+                                    media_urls.add(s)
+                                    # 从 video.src 读到的地址没有网络请求头，
+                                    # 用所在页面 URL 作为 Referer（CDN 防盗链认这个）
+                                    if s not in media_headers:
+                                        media_headers[s] = {"referer": frame.url}
                             except Exception:
                                 continue   # 该 frame 还没加载完，忽略
                         if any(u for u in media_urls
@@ -290,7 +317,8 @@ class Parser:
         for u in media_urls:
             kind = self._classify_url(u)
             if kind:
-                results.append(VideoInfo(u, kind, "浏览器抓取"))
+                results.append(VideoInfo(u, kind, "浏览器抓取",
+                                         headers=media_headers.get(u)))
         return results
 
     def _classify_url(self, url: str) -> str | None:

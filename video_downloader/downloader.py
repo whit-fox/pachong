@@ -17,6 +17,7 @@ downloader.py —— 单文件下载核心（适用于 mp4 / webm 等直链）
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
@@ -41,7 +42,8 @@ class Downloader:
                  filename: str = None, referer: str = None,
                  cookies=None, threads: int = THREADS,
                  extra_headers: dict = None,
-                 session: requests.Session = None):
+                 session: requests.Session = None,
+                 progress_callback=None):
         self.url = url
         self.output_dir = output_dir
         self.filename = filename or self._guess_filename(url)
@@ -50,6 +52,13 @@ class Downloader:
         self.extra_headers = extra_headers or {}
         # 下载文件走代理（视频 CDN 常为海外节点，直连超时）
         self.session = session or build_session(cookies=cookies, use_proxy=True)
+        self._progress_cb = progress_callback   # GUI 进度回调 (downloaded, total, speed)
+        self._cb_last_time = 0.0                 # 进度回调节流（瞬时速度计算）
+        self._cb_last_bytes = 0                  # 上次回调时的已下载字节
+        self._smooth_speed = None                # 平滑后的瞬时速度
+
+        self._pause_event = threading.Event()    # 暂停/继续
+        self._pause_event.set()                  # 默认运行中
 
         self._progress = None            # tqdm 进度条对象
         self._lock = threading.Lock()    # 多线程更新进度时加锁
@@ -73,12 +82,21 @@ class Downloader:
         logger.info("目标: %s (%s, accept-ranges=%s)",
                     self.filename, human_size(size or 0), accept_ranges)
 
+        # 记录开始时间，用于统计平均速度
+        start = time.time()
+
         # 满足条件才多线程分片：知道大小 && 支持 Range && 文件足够大 && 线程数>1
         if (size and accept_ranges and self.threads > 1
                 and size > CHUNK_SIZE * 8):
             self._download_multithread(out_path, size)
         else:
             self._download_single(out_path, size)
+
+        # 汇总平均速度
+        elapsed = time.time() - start
+        if elapsed > 0.1 and self._downloaded > 0:
+            logger.info("平均下载速度: %s/s (用时 %.1f 秒)",
+                        human_size(self._downloaded / elapsed), elapsed)
         return out_path
 
     # ------------------------------------------------------------
@@ -125,9 +143,13 @@ class Downloader:
         return None, False
 
     def _headers(self) -> dict:
-        """组装请求头（User-Agent 已含于 session，这里补 Referer）"""
+        """组装请求头
+
+        extra_headers（浏览器抓取到的真实防盗链头）优先；
+        没有时才用页面 URL 作为 Referer。
+        """
         headers = dict(self.extra_headers)
-        if self.referer:
+        if self.referer and "referer" not in headers:
             headers["Referer"] = self.referer
         return headers
 
@@ -227,6 +249,8 @@ class Downloader:
                         if chunk:
                             f.write(chunk)
                             self._add_progress(len(chunk))
+                        # 暂停时阻塞在这里，继续后接着下
+                        self._pause_event.wait()
 
                 # 校验分片完整性
                 if os.path.getsize(path) < target_size:
@@ -284,6 +308,8 @@ class Downloader:
                         if chunk:
                             f.write(chunk)
                             self._add_progress(len(chunk))
+                        # 暂停时阻塞在这里，继续后接着下
+                        self._pause_event.wait()
                 break
             except (requests.ConnectionError, requests.Timeout,
                     requests.HTTPError) as e:
@@ -329,16 +355,37 @@ class Downloader:
     def _init_progress(self, total, initial: int) -> None:
         self._total = total
         self._downloaded = 0
+        # 文件名过长会把最右侧的网速(MB/s)挤出屏幕，这里截短显示
+        desc = (self.filename[:16] + "…") if len(self.filename) > 16 else self.filename
         self._progress = tqdm(
             total=total, initial=initial, unit="B", unit_scale=True,
-            desc=self.filename, mininterval=0.2, ncols=90,
+            unit_divisor=1024, desc=desc, mininterval=0.2, ncols=90, leave=True,
         )
+        self._start_time = time.time()
+        self._cb_last_time = time.time()
+        self._cb_last_bytes = 0
+        self._smooth_speed = None
 
     def _add_progress(self, n: int) -> None:
         with self._lock:
             self._downloaded += n
             if self._progress:
                 self._progress.update(n)
+            # 回调 GUI（节流 0.2s）：用两个回调点之间的增量算瞬时速度，再平滑，
+            # 避免显示"从开始到现在的平均速度"或错误的巨大数值
+            if self._progress_cb:
+                now = time.time()
+                if now - self._cb_last_time >= 0.2:
+                    dt = now - self._cb_last_time
+                    db = self._downloaded - self._cb_last_bytes
+                    self._cb_last_time = now
+                    self._cb_last_bytes = self._downloaded
+                    inst = db / max(dt, 0.001)
+                    if self._smooth_speed is None:
+                        self._smooth_speed = inst
+                    else:
+                        self._smooth_speed = self._smooth_speed * 0.7 + inst * 0.3
+                    self._progress_cb(self._downloaded, self._total, self._smooth_speed)
 
     def _reset_progress(self) -> None:
         """从头下载时重置进度条"""
@@ -352,6 +399,20 @@ class Downloader:
         if self._progress:
             self._progress.close()
             self._progress = None
+
+    # ------------------------------------------------------------
+    # 暂停 / 继续
+    # ------------------------------------------------------------
+    def pause(self) -> None:
+        """暂停下载：下载线程会阻塞在分片读取之间"""
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        """继续下载"""
+        self._pause_event.set()
+
+    def is_paused(self) -> bool:
+        return not self._pause_event.is_set()
 
     # ------------------------------------------------------------
     # 工具
